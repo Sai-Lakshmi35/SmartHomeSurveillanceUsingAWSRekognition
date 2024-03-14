@@ -1,0 +1,184 @@
+aws rekognition create-collection --collection-id facerecognition_collection --region us-east-1
+-------------------------------------------------------------------------
+aws dynamodb create-table --table-name facerecognition --attribute-definitionsAttributeName=RekognitionId,AttributeType=S --key-schema AttributeName=RekognitionId,KeyType=HASH --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 --region us-east-1
+
+-------------------------------------------------------------------------------
+lambda_function.py
+..................
+
+from __future__ import print_function
+
+import boto3
+from decimal import Decimal
+import json
+import urllib
+
+print('Loading function')
+
+dynamodb = boto3.client('dynamodb')
+s3 = boto3.client('s3')
+rekognition = boto3.client('rekognition')
+
+
+# --------------- Helper Functions ------------------
+
+def index_faces(bucket, key):
+
+    response = rekognition.index_faces(
+        Image={"S3Object":
+            {"Bucket": bucket,
+            "Name": key}},
+            CollectionId="famouspersons")
+    return response
+    
+def update_index(tableName,faceId, fullName):
+    response = dynamodb.put_item(
+        TableName=tableName,
+        Item={
+            'RekognitionId': {'S': faceId},
+            'FullName': {'S': fullName}
+            }
+        ) 
+    
+# --------------- Main handler ------------------
+
+def lambda_handler(event, context):
+
+    # Get the object from the event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    print("Records: ",event['Records'])
+    key = event['Records'][0]['s3']['object']['key']
+    print("Key: ",key)
+    # key = key.encode()
+    # key = urllib.parse.unquote_plus(key)
+
+    try:
+
+        # Calls Amazon Rekognition IndexFaces API to detect faces in S3 object 
+        # to index faces into specified collection
+        
+        response = index_faces(bucket, key)
+        
+        # Commit faceId and full name object metadata to DynamoDB
+        
+        if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+            faceId = response['FaceRecords'][0]['Face']['FaceId']
+
+            ret = s3.head_object(Bucket=bucket,Key=key)
+            personFullName = ret['Metadata']['fullname']
+
+            update_index('face_recognition',faceId,personFullName)
+
+        # Print response to console
+        print(response)
+
+        return response
+    except Exception as e:
+        print(e)
+        print("Error processing object {} from bucket {}. ".format(key, bucket))
+        raise e
+
+
+------------------------------------------------------------------------------------------------------------
+putimages.py
+
+import boto3
+
+s3 = boto3.resource('s3')
+
+# Get list of objects for indexing
+images=[('image1.jpg','Elon Musk'),
+      ('image2.jpg','Elon Musk'),
+      ('image3.jpg','Bill Gates'),
+      ('image4.jpg','Bill Gates'),
+      ('image5.jpg','Sundar Pichai'),
+      ('image6.jpg','Sundar Pichai')
+      ]
+
+# Iterate through list to upload objects to S3   
+for image in images:
+    file = open(image[0],'rb')
+    object = s3.Object('famouspersons-images','index/'+ image[0])
+    ret = object.put(Body=file,
+                    Metadata={'FullName':image[1]})
+---------------------------------------------------------------------------------------------------------------
+policy json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::bucket-name/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:PutItem"
+            ],
+            "Resource": [
+                "arn:aws:dynamodb:aws-region:account-id:table/family_collection"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "rekognition:IndexFaces"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+----------------------------------------------------------------------------------------------------
+testing.py
+
+import boto3
+import io
+from PIL import Image
+
+rekognition = boto3.client('rekognition', region_name='us-east-1')
+dynamodb = boto3.client('dynamodb', region_name='us-east-1')
+
+image_path = input("Enter path of the image to check: ")
+
+image = Image.open(image_path)
+stream = io.BytesIO()
+image.save(stream,format="JPEG")
+image_binary = stream.getvalue()
+
+
+response = rekognition.search_faces_by_image(
+        CollectionId='famouspersons',
+        Image={'Bytes':image_binary}                                       
+        )
+
+found = False
+for match in response['FaceMatches']:
+    print (match['Face']['FaceId'],match['Face']['Confidence'])
+        
+    face = dynamodb.get_item(
+        TableName='face_recognition',  
+        Key={'RekognitionId': {'S': match['Face']['FaceId']}}
+        )
+    
+    if 'Item' in face:
+        print ("Found Person: ",face['Item']['FullName']['S'])
+        found = True
+
+if not found:
+    print("Person cannot be recognized")
+
+-------------------------------------------------------------------------------------------
